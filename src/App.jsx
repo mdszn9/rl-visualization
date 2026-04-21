@@ -26,12 +26,12 @@ function randn() {
 
 function envReset() {
   return {
-    x: WORLD_W / 2 + rand(-2.5, 2.5),
+    x: WORLD_W / 2 + rand(-1.8, 1.8),
     y: WORLD_H - 2,
-    vx: rand(-0.22, 0.22),     // horizontal drift — passive fall crashes off-pad
-    vy: rand(-0.25, -0.1),     // already descending — must use main engine
-    theta: rand(-0.15, 0.15),  // tilted — must stabilize
-    omega: rand(-0.01, 0.01),
+    vx: rand(-0.18, 0.18),
+    vy: rand(-0.22, -0.1),
+    theta: rand(-0.12, 0.12),
+    omega: rand(-0.008, 0.008),
     steps: 0,
     landed: false,
     crashed: false,
@@ -64,13 +64,13 @@ function envStep(s, action) {
   // reward shaping: stronger gradient toward pad, especially near ground
   const heightFactor = Math.max(0, 1 - Math.max(0, y) / WORLD_H);
   let reward = 0;
-  reward -= Math.abs(x - PAD_X) * (0.02 + 0.06 * heightFactor);
-  reward -= Math.abs(theta) * 0.12;
-  reward -= (Math.abs(vx) * 0.08 + Math.abs(vy) * 0.04);
-  reward -= 0.012;
+  reward -= Math.abs(x - PAD_X) * (0.025 + 0.08 * heightFactor);
+  reward -= Math.abs(theta) * 0.3;
+  reward -= (Math.abs(vx) * 0.15 + Math.abs(vy) * 0.08);
+  reward -= 0.01;
   // hovering-over-pad bonus: descending slowly above the pad is good
   if (Math.abs(x - PAD_X) < PAD_HALF && y > GROUND_Y + 0.5 && vy > -0.35 && vy < 0.1) {
-    reward += 0.18;
+    reward += 0.25;
   }
 
   const ns = { x, y, vx, vy, theta, omega, steps, landed: false, crashed: false, lastAction: action, done: false };
@@ -150,12 +150,29 @@ function runEpisode(weights, maxSteps = MAX_STEPS) {
   return total;
 }
 
+function runEpisodeFrom(weights, startState, maxSteps = MAX_STEPS) {
+  let s = { ...startState };
+  let total = 0;
+  for (let t = 0; t < maxSteps; t++) {
+    const a = policyAction(weights, s);
+    const { state, reward, done } = envStep(s, a);
+    s = state;
+    total += reward;
+    if (done) break;
+  }
+  return total;
+}
+
 function cemGeneration(mean, std, popSize, elite, evalEpisodes) {
+  // Fix starting states for the whole generation — every policy is judged
+  // on the exact same set of scenarios, so CEM ranks on real skill, not
+  // start-state luck. This is the single biggest CEM noise-killer.
+  const starts = [...Array(evalEpisodes)].map(() => envReset());
   const pop = [];
   for (let p = 0; p < popSize; p++) {
     const w = mean.map((row, a) => row.map((m, i) => m + std[a][i] * randn()));
     let totalR = 0;
-    for (let e = 0; e < evalEpisodes; e++) totalR += runEpisode(w);
+    for (let e = 0; e < evalEpisodes; e++) totalR += runEpisodeFrom(w, starts[e]);
     pop.push({ w, reward: totalR / evalEpisodes });
   }
   pop.sort((a, b) => b.reward - a.reward);
@@ -290,6 +307,8 @@ export default function App() {
   const trainedLastRewardRef = useRef(null);
   const untrainedHoldUntilRef = useRef(0);
   const trainedHoldUntilRef = useRef(0);
+  // rolling action-usage counters for the trained agent (last ~200 steps)
+  const trainedActionBufRef = useRef([]);
 
   // UI state (only updated at frame tick)
   const [, forceRender] = useState(0);
@@ -343,6 +362,9 @@ export default function App() {
           const { state, reward, done } = envStep(trainedState.current, a);
           trainedState.current = state;
           trainedEpRewardRef.current += reward;
+          const buf = trainedActionBufRef.current;
+          buf.push(a);
+          if (buf.length > 200) buf.shift();
           if (done) {
             trainedLastRewardRef.current = trainedEpRewardRef.current;
             trainedHoldUntilRef.current = 24;
@@ -549,11 +571,26 @@ export default function App() {
               Reward &gt; 80 usually means the agent is landing on the pad.
             </div>
             <div style={{ marginTop: 10, paddingTop: 10, borderTop: "1px solid #1e293b", fontSize: 11, color: "#94a3b8", lineHeight: 1.6 }}>
-              <div style={{ color: "#fbbf24", fontSize: 10, marginBottom: 4 }}>actions (3)</div>
-              <div>0: fire main engine</div>
-              <div>1: rotate CCW (lean left)</div>
-              <div>2: rotate CW (lean right)</div>
-              <div style={{ color: "#64748b", marginTop: 4, fontSize: 10 }}>no no-op — agent must act each step</div>
+              <div style={{ color: "#fbbf24", fontSize: 10, marginBottom: 6 }}>action usage (trained, last ~200 steps)</div>
+              {(() => {
+                const buf = trainedActionBufRef.current;
+                const total = Math.max(1, buf.length);
+                const counts = [0, 0, 0];
+                for (const a of buf) counts[a] += 1;
+                const pct = counts.map((c) => (c / total) * 100);
+                const labels = ["main", "rot CCW", "rot CW"];
+                const colors = ["#f97316", "#38bdf8", "#a78bfa"];
+                return labels.map((lbl, i) => (
+                  <div key={i} style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 3 }}>
+                    <div style={{ width: 56, fontSize: 10, color: colors[i] }}>{lbl}</div>
+                    <div style={{ flex: 1, background: "#1e293b", height: 8, borderRadius: 2, overflow: "hidden" }}>
+                      <div style={{ width: `${pct[i].toFixed(1)}%`, height: "100%", background: colors[i] }} />
+                    </div>
+                    <div style={{ width: 36, fontSize: 10, textAlign: "right", color: "#cbd5e1" }}>{pct[i].toFixed(0)}%</div>
+                  </div>
+                ));
+              })()}
+              <div style={{ color: "#64748b", marginTop: 6, fontSize: 10 }}>no no-op — agent must act each step</div>
             </div>
           </div>
         </div>
