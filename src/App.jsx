@@ -196,6 +196,7 @@ function useEpisodePlayer(episodes, fps = 30, holdFrames = 25) {
 export default function App() {
   const [data, setData] = useState(null);
   const [error, setError] = useState(null);
+  const [showTrained, setShowTrained] = useState(false);
 
   useEffect(() => {
     const base = import.meta.env.BASE_URL || "/";
@@ -232,10 +233,10 @@ export default function App() {
             Reinforcement Learning · LunarLander-v3 (PPO)
           </h1>
           <p style={{ color: "#94a3b8", fontSize: 12, marginTop: 4, lineHeight: 1.55 }}>
-            The right-panel agent was trained offline with PPO (PyTorch, Gymnasium's real
-            Box2D LunarLander). What you're seeing is a replay of its recorded episodes.
-            The left panel is a baseline that picks uniformly-random actions in the same
-            environment.
+            A baseline agent that picks uniformly-random actions is always shown on the left.
+            Click <strong style={{ color: "#34d399" }}>Load PPO agent</strong> to reveal a
+            second panel replaying an agent trained offline with PPO (PyTorch, Gymnasium's
+            real Box2D LunarLander) alongside for comparison.
           </p>
         </header>
 
@@ -250,7 +251,7 @@ export default function App() {
 
         {data && (
           <>
-            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 18 }}>
+            <div style={{ display: "grid", gridTemplateColumns: showTrained ? "1fr 1fr" : "1fr", gap: 18, maxWidth: showTrained ? "none" : 620, margin: showTrained ? "0" : "0 auto" }}>
               <div style={panel}>
                 <LanderScene
                   episode={untrainedEp}
@@ -259,76 +260,90 @@ export default function App() {
                   badgeColor="#f87171"
                   bodyColor="#94a3b8"
                 />
-                <div style={{ display: "flex", gap: 8, marginTop: 10, alignItems: "center" }}>
+                <div style={{ display: "flex", gap: 8, marginTop: 10, alignItems: "center", flexWrap: "wrap" }}>
                   <button onClick={untrainedPlayer.nextEpisode} style={btn(false, "#64748b")}>
                     Next episode
                   </button>
                   <button onClick={untrainedPlayer.reset} style={btn(false, "#64748b")}>
                     Restart
                   </button>
+                  {!showTrained && (
+                    <button onClick={() => setShowTrained(true)} style={btn(true, "#34d399")}>
+                      Load PPO agent →
+                    </button>
+                  )}
                   <span style={{ color: "#64748b", fontSize: 10, marginLeft: "auto" }}>
                     uniform random actions
                   </span>
                 </div>
               </div>
 
-              <div style={panel}>
-                <LanderScene
-                  episode={trainedEp}
-                  frameIdx={trainedPlayer.frameIdx}
-                  title={`PPO TRAINED · ep ${trainedPlayer.epIdx + 1}/${trained.length}`}
-                  badgeColor="#34d399"
-                  bodyColor="#38bdf8"
-                />
-                <div style={{ display: "flex", gap: 8, marginTop: 10, alignItems: "center" }}>
-                  <button onClick={trainedPlayer.nextEpisode} style={btn(false, "#64748b")}>
-                    Next episode
-                  </button>
-                  <button onClick={trainedPlayer.reset} style={btn(false, "#64748b")}>
-                    Restart
-                  </button>
-                  <span style={{ color: "#64748b", fontSize: 10, marginLeft: "auto" }}>
-                    PPO policy · deterministic argmax
-                  </span>
+              {showTrained && (
+                <div style={panel}>
+                  <LanderScene
+                    episode={trainedEp}
+                    frameIdx={trainedPlayer.frameIdx}
+                    title={`PPO TRAINED · ep ${trainedPlayer.epIdx + 1}/${trained.length}`}
+                    badgeColor="#34d399"
+                    bodyColor="#38bdf8"
+                  />
+                  <div style={{ display: "flex", gap: 8, marginTop: 10, alignItems: "center", flexWrap: "wrap" }}>
+                    <button onClick={trainedPlayer.nextEpisode} style={btn(false, "#64748b")}>
+                      Next episode
+                    </button>
+                    <button onClick={trainedPlayer.reset} style={btn(false, "#64748b")}>
+                      Restart
+                    </button>
+                    <button onClick={() => setShowTrained(false)} style={btn(false, "#64748b")}>
+                      Hide
+                    </button>
+                    <span style={{ color: "#64748b", fontSize: 10, marginLeft: "auto" }}>
+                      PPO policy · deterministic argmax
+                    </span>
+                  </div>
                 </div>
-              </div>
+              )}
             </div>
 
-            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 18, marginTop: 18 }}>
-              <div style={panel}>
-                <div style={{ fontSize: 11, color: "#94a3b8", marginBottom: 8 }}>trained evaluation</div>
-                <div style={{ fontSize: 12, lineHeight: 1.8 }}>
-                  <div>episodes recorded: <span style={{ color: "#e2e8f0" }}>{trained.length}</span></div>
-                  <div>successful landings: <span style={{ color: "#34d399" }}>{landedCount} / {trained.length}</span></div>
-                  <div>avg reward: <span style={{ color: "#67e8f9" }}>{avgReward.toFixed(1)}</span></div>
-                  <div style={{ color: "#64748b", fontSize: 10, marginTop: 4 }}>
-                    LunarLander is considered "solved" at ≥200 mean reward.
-                  </div>
-                </div>
-              </div>
-
-              <div style={panel}>
-                <div style={{ fontSize: 11, color: "#94a3b8", marginBottom: 8 }}>episode reward table</div>
-                <div style={{ fontSize: 11, lineHeight: 1.6 }}>
-                  <div style={{ display: "grid", gridTemplateColumns: "40px 70px 70px 1fr", color: "#64748b", fontSize: 10, borderBottom: "1px solid #1e293b", paddingBottom: 4, marginBottom: 4 }}>
-                    <div>#</div><div>trained</div><div>random</div><div></div>
-                  </div>
-                  {[...Array(Math.max(trained.length, untrained.length))].map((_, i) => (
-                    <div key={i} style={{ display: "grid", gridTemplateColumns: "40px 70px 70px 1fr", padding: "2px 0" }}>
-                      <div style={{ color: "#64748b" }}>{i + 1}</div>
-                      <div style={{ color: trained[i] ? (trained[i].landed ? "#34d399" : "#f87171") : "#475569" }}>
-                        {trained[i] ? trained[i].total_reward.toFixed(0) : "–"}
-                      </div>
-                      <div style={{ color: untrained[i] ? (untrained[i].landed ? "#34d399" : "#f87171") : "#475569" }}>
-                        {untrained[i] ? untrained[i].total_reward.toFixed(0) : "–"}
-                      </div>
-                      <div style={{ color: trained[i]?.landed ? "#34d399" : "#64748b", fontSize: 10 }}>
-                        {trained[i]?.landed ? "landed" : ""}
-                      </div>
+            <div style={{ display: "grid", gridTemplateColumns: showTrained ? "1fr 1fr 1fr" : "1fr", gap: 18, marginTop: 18, maxWidth: showTrained ? "none" : 620, margin: showTrained ? "18px 0 0" : "18px auto 0" }}>
+              {showTrained && (
+                <div style={panel}>
+                  <div style={{ fontSize: 11, color: "#94a3b8", marginBottom: 8 }}>trained evaluation</div>
+                  <div style={{ fontSize: 12, lineHeight: 1.8 }}>
+                    <div>episodes recorded: <span style={{ color: "#e2e8f0" }}>{trained.length}</span></div>
+                    <div>successful landings: <span style={{ color: "#34d399" }}>{landedCount} / {trained.length}</span></div>
+                    <div>avg reward: <span style={{ color: "#67e8f9" }}>{avgReward.toFixed(1)}</span></div>
+                    <div style={{ color: "#64748b", fontSize: 10, marginTop: 4 }}>
+                      LunarLander is considered "solved" at ≥200 mean reward.
                     </div>
-                  ))}
+                  </div>
                 </div>
-              </div>
+              )}
+
+              {showTrained && (
+                <div style={panel}>
+                  <div style={{ fontSize: 11, color: "#94a3b8", marginBottom: 8 }}>episode reward table</div>
+                  <div style={{ fontSize: 11, lineHeight: 1.6 }}>
+                    <div style={{ display: "grid", gridTemplateColumns: "40px 70px 70px 1fr", color: "#64748b", fontSize: 10, borderBottom: "1px solid #1e293b", paddingBottom: 4, marginBottom: 4 }}>
+                      <div>#</div><div>trained</div><div>random</div><div></div>
+                    </div>
+                    {[...Array(Math.max(trained.length, untrained.length))].map((_, i) => (
+                      <div key={i} style={{ display: "grid", gridTemplateColumns: "40px 70px 70px 1fr", padding: "2px 0" }}>
+                        <div style={{ color: "#64748b" }}>{i + 1}</div>
+                        <div style={{ color: trained[i] ? (trained[i].landed ? "#34d399" : "#f87171") : "#475569" }}>
+                          {trained[i] ? trained[i].total_reward.toFixed(0) : "–"}
+                        </div>
+                        <div style={{ color: untrained[i] ? (untrained[i].landed ? "#34d399" : "#f87171") : "#475569" }}>
+                          {untrained[i] ? untrained[i].total_reward.toFixed(0) : "–"}
+                        </div>
+                        <div style={{ color: trained[i]?.landed ? "#34d399" : "#64748b", fontSize: 10 }}>
+                          {trained[i]?.landed ? "landed" : ""}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
 
               <div style={panel}>
                 <div style={{ fontSize: 11, color: "#94a3b8", marginBottom: 8 }}>legend · actions</div>
