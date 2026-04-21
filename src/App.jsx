@@ -11,11 +11,7 @@ const PAD_X = 10, PAD_HALF = 1.9;
 const GROUND_Y = 0.55;
 const MAX_STEPS = 400;
 
-// Action space: 0 = main thrust, 1 = rotate CCW, 2 = rotate CW.
-// No-op is intentionally excluded: with a linear policy, CEM falls into the
-// trivial "always do nothing" attractor that lands sometimes by lucky starts
-// but never learns active control. Removing no-op forces the agent to learn
-// to balance thrusters.
+// Actions: 0 = main thrust, 1 = rotate CCW, 2 = rotate CW.
 const N_OBS = 7, N_ACT = 3;
 
 function rand(a, b) { return Math.random() * (b - a) + a; }
@@ -61,14 +57,12 @@ function envStep(s, action) {
   theta += omega;
   steps += 1;
 
-  // reward shaping: stronger gradient toward pad, especially near ground
   const heightFactor = Math.max(0, 1 - Math.max(0, y) / WORLD_H);
   let reward = 0;
   reward -= Math.abs(x - PAD_X) * (0.025 + 0.08 * heightFactor);
   reward -= Math.abs(theta) * 0.3;
   reward -= (Math.abs(vx) * 0.15 + Math.abs(vy) * 0.08);
   reward -= 0.01;
-  // hovering-over-pad bonus: descending slowly above the pad is good
   if (Math.abs(x - PAD_X) < PAD_HALF && y > GROUND_Y + 0.5 && vy > -0.35 && vy < 0.1) {
     reward += 0.25;
   }
@@ -82,13 +76,8 @@ function envStep(s, action) {
     const atPad = Math.abs(x - PAD_X) < PAD_HALF;
     const soft = Math.abs(vx) < 0.35 && Math.abs(vy) < 0.55;
     const upright = Math.abs(theta) < 0.4;
-    if (atPad && soft && upright) {
-      reward += 150;
-      ns.landed = true;
-    } else {
-      reward -= 40;
-      ns.crashed = true;
-    }
+    if (atPad && soft && upright) { reward += 150; ns.landed = true; }
+    else { reward -= 40; ns.crashed = true; }
   }
   if (x < -1 || x > WORLD_W + 1 || y > WORLD_H + 3) {
     done = true;
@@ -112,91 +101,182 @@ function obsVec(s) {
   ];
 }
 
-function policyAction(W, s) {
-  const o = obsVec(s);
-  let best = 0, bestVal = -Infinity;
-  for (let a = 0; a < N_ACT; a++) {
-    let v = 0;
-    for (let i = 0; i < N_OBS; i++) v += W[a][i] * o[i];
-    if (v > bestVal) { bestVal = v; best = a; }
-  }
-  return best;
-}
-
-function makeZeros() {
-  return [...Array(N_ACT)].map(() => [...Array(N_OBS)].fill(0));
-}
-function makeSmallRandom(scale = 0.2) {
+// === PPO: linear softmax policy + linear value function ===
+function mkWp(scale = 0.15) {
   return [...Array(N_ACT)].map(() => [...Array(N_OBS)].map(() => randn() * scale));
 }
-function makeInitPolicy() {
-  return makeSmallRandom(0.3);
-}
-function makeUniform(val) {
-  return [...Array(N_ACT)].map(() => [...Array(N_OBS)].fill(val));
-}
-function cloneW(W) { return W.map((r) => r.slice()); }
+function mkWv() { return new Array(N_OBS).fill(0); }
+function cloneWp(W) { return W.map((r) => r.slice()); }
+function cloneWv(W) { return W.slice(); }
 
-function runEpisode(weights, maxSteps = MAX_STEPS) {
+function policyForward(Wp, obs) {
+  const logits = new Array(N_ACT);
+  for (let a = 0; a < N_ACT; a++) {
+    let v = 0;
+    for (let i = 0; i < N_OBS; i++) v += Wp[a][i] * obs[i];
+    logits[a] = v;
+  }
+  const maxL = Math.max(...logits);
+  const exps = logits.map((l) => Math.exp(l - maxL));
+  const sum = exps.reduce((a, b) => a + b, 0);
+  return exps.map((e) => e / sum);
+}
+
+function valueForward(Wv, obs) {
+  let v = 0;
+  for (let i = 0; i < N_OBS; i++) v += Wv[i] * obs[i];
+  return v;
+}
+
+function sampleFromProbs(probs) {
+  const r = Math.random();
+  let c = 0;
+  for (let a = 0; a < N_ACT; a++) {
+    c += probs[a];
+    if (r < c) return a;
+  }
+  return N_ACT - 1;
+}
+
+function collectRollout(Wp, Wv, rolloutSteps) {
+  const transitions = [];
+  const epReturns = [];
   let s = envReset();
-  let total = 0;
-  for (let t = 0; t < maxSteps; t++) {
-    const a = policyAction(weights, s);
-    const { state, reward, done } = envStep(s, a);
-    s = state;
-    total += reward;
-    if (done) break;
+  let epRet = 0;
+  for (let t = 0; t < rolloutSteps; t++) {
+    const o = obsVec(s);
+    const probs = policyForward(Wp, o);
+    const a = sampleFromProbs(probs);
+    const logp = Math.log(probs[a] + 1e-10);
+    const v = valueForward(Wv, o);
+    const { state: s2, reward, done } = envStep(s, a);
+    transitions.push({ obs: o, a, reward, done, v, logp });
+    epRet += reward;
+    if (done) {
+      epReturns.push(epRet);
+      epRet = 0;
+      s = envReset();
+    } else {
+      s = s2;
+    }
   }
-  return total;
+  const lastObs = obsVec(s);
+  const lastV = valueForward(Wv, lastObs);
+  return { transitions, epReturns, lastV };
 }
 
-function runEpisodeFrom(weights, startState, maxSteps = MAX_STEPS) {
-  let s = { ...startState };
-  let total = 0;
-  for (let t = 0; t < maxSteps; t++) {
-    const a = policyAction(weights, s);
-    const { state, reward, done } = envStep(s, a);
-    s = state;
-    total += reward;
-    if (done) break;
+function computeAdvantages(transitions, lastV, gamma, lambda) {
+  const n = transitions.length;
+  const advantages = new Array(n);
+  const returns = new Array(n);
+  let gae = 0;
+  let nextV = lastV;
+  let nextNonTerm = 1;
+  for (let t = n - 1; t >= 0; t--) {
+    const tr = transitions[t];
+    const delta = tr.reward + gamma * nextV * nextNonTerm - tr.v;
+    gae = delta + gamma * lambda * nextNonTerm * gae;
+    advantages[t] = gae;
+    returns[t] = gae + tr.v;
+    nextV = tr.v;
+    nextNonTerm = tr.done ? 0 : 1;
   }
-  return total;
+  return { advantages, returns };
 }
 
-function cemGeneration(mean, std, popSize, elite, evalEpisodes) {
-  // Fix starting states for the whole generation — every policy is judged
-  // on the exact same set of scenarios, so CEM ranks on real skill, not
-  // start-state luck. This is the single biggest CEM noise-killer.
-  const starts = [...Array(evalEpisodes)].map(() => envReset());
-  const pop = [];
-  for (let p = 0; p < popSize; p++) {
-    const w = mean.map((row, a) => row.map((m, i) => m + std[a][i] * randn()));
-    let totalR = 0;
-    for (let e = 0; e < evalEpisodes; e++) totalR += runEpisodeFrom(w, starts[e]);
-    pop.push({ w, reward: totalR / evalEpisodes });
+function ppoUpdate(Wp, Wv, transitions, advantages, returns, hp) {
+  const { clipEps, lr, valueCoef, entropyCoef } = hp;
+  const n = transitions.length;
+
+  // Normalize advantages (standard PPO practice)
+  let mean = 0;
+  for (let i = 0; i < n; i++) mean += advantages[i];
+  mean /= n;
+  let variance = 0;
+  for (let i = 0; i < n; i++) variance += (advantages[i] - mean) ** 2;
+  variance /= n;
+  const std = Math.sqrt(variance) + 1e-8;
+  const advNorm = new Array(n);
+  for (let i = 0; i < n; i++) advNorm[i] = (advantages[i] - mean) / std;
+
+  const gradWp = [...Array(N_ACT)].map(() => new Array(N_OBS).fill(0));
+  const gradWv = new Array(N_OBS).fill(0);
+
+  let policyLoss = 0;
+  let valueLoss = 0;
+  let approxKL = 0;
+  let clipFrac = 0;
+
+  for (let i = 0; i < n; i++) {
+    const tr = transitions[i];
+    const obs = tr.obs;
+    const a = tr.a;
+    const oldLogP = tr.logp;
+    const adv = advNorm[i];
+    const ret = returns[i];
+
+    // Policy forward at CURRENT (possibly updated) weights
+    const probs = policyForward(Wp, obs);
+    const newLogP = Math.log(probs[a] + 1e-10);
+    const ratio = Math.exp(newLogP - oldLogP);
+
+    // Stats
+    approxKL += (oldLogP - newLogP);
+    if (ratio > 1 + clipEps || ratio < 1 - clipEps) clipFrac += 1;
+
+    // Clipped surrogate objective gradient
+    // J = min(ratio * adv, clip(ratio, 1±ε) * adv)
+    // If clip bound is binding AND in the direction that would hurt J, grad is zero.
+    let policyCoef = 0;
+    let surrogate = 0;
+    if (adv >= 0) {
+      if (ratio < 1 + clipEps) { policyCoef = adv * ratio; surrogate = adv * ratio; }
+      else { surrogate = adv * (1 + clipEps); }
+    } else {
+      if (ratio > 1 - clipEps) { policyCoef = adv * ratio; surrogate = adv * ratio; }
+      else { surrogate = adv * (1 - clipEps); }
+    }
+    policyLoss -= surrogate; // we maximize surrogate => loss is negated
+
+    // ∂log π(a|s)/∂Wp[act][k] = (1[act=a] - π(act|s)) * obs[k]
+    for (let act = 0; act < N_ACT; act++) {
+      const dLogPdL = (act === a ? 1 : 0) - probs[act];
+      const coef = policyCoef * dLogPdL;
+      for (let k = 0; k < N_OBS; k++) gradWp[act][k] += coef * obs[k];
+    }
+
+    // Entropy bonus: encourages exploration, prevents premature determinism
+    if (entropyCoef > 0) {
+      let H = 0;
+      for (let act = 0; act < N_ACT; act++) H -= probs[act] * Math.log(probs[act] + 1e-10);
+      for (let act = 0; act < N_ACT; act++) {
+        const dHdL = -probs[act] * (Math.log(probs[act] + 1e-10) + H);
+        for (let k = 0; k < N_OBS; k++) gradWp[act][k] += entropyCoef * dHdL * obs[k];
+      }
+    }
+
+    // Value: L_v = 0.5 * (V(s) - ret)^2
+    const v = valueForward(Wv, obs);
+    const vErr = v - ret;
+    valueLoss += 0.5 * vErr * vErr;
+    for (let k = 0; k < N_OBS; k++) gradWv[k] += vErr * obs[k];
   }
-  pop.sort((a, b) => b.reward - a.reward);
-  const top = pop.slice(0, elite);
-  const newMean = mean.map((row, a) => row.map((_, i) =>
-    top.reduce((s, p) => s + p.w[a][i], 0) / top.length
-  ));
-  // std floor (0.15) keeps exploration alive longer to escape "do nothing" local optimum
-  const STD_FLOOR = 0.15;
-  const ANNEAL = 0.98;
-  const newStd = mean.map((row, a) => row.map((_, i) => {
-    const m = newMean[a][i];
-    const v = top.reduce((s, p) => s + (p.w[a][i] - m) ** 2, 0) / top.length;
-    return Math.max(STD_FLOOR, Math.sqrt(v)) * ANNEAL;
-  }));
+
+  // Ascent on policy objective, descent on value loss
+  const newWp = Wp.map((row, a) => row.map((w, i) => w + (lr / n) * gradWp[a][i]));
+  const newWv = Wv.map((w, i) => w - (lr * valueCoef / n) * gradWv[i]);
+
   return {
-    mean: newMean,
-    std: newStd,
-    best: pop[0],
-    avg: pop.reduce((s, p) => s + p.reward, 0) / pop.length,
+    Wp: newWp,
+    Wv: newWv,
+    policyLoss: policyLoss / n,
+    valueLoss: valueLoss / n,
+    approxKL: approxKL / n,
+    clipFrac: clipFrac / n,
   };
 }
 
-// === Rendering helpers ===
+// === Rendering ===
 const font = "'JetBrains Mono', 'Fira Code', 'SF Mono', monospace";
 
 function LanderView({ state, subtitle, badgeColor, bodyColor, epReward, lastEpReward }) {
@@ -218,21 +298,17 @@ function LanderView({ state, subtitle, badgeColor, bodyColor, epReward, lastEpRe
 
   return (
     <svg viewBox={`0 0 ${pxW} ${pxH}`} style={{ width: "100%", display: "block", background: "#070914", borderRadius: 8 }}>
-      {/* stars */}
       {[...Array(22)].map((_, i) => {
         const sx = (i * 137.5) % pxW;
         const sy = (i * 47.3) % (pxH - 50);
         const r = (i % 3 === 0) ? 0.9 : 0.5;
         return <circle key={i} cx={sx} cy={sy} r={r} fill="#cbd5e1" opacity={0.4 + (i % 3) * 0.15} />;
       })}
-      {/* ground */}
       <rect x={0} y={groundY} width={pxW} height={pxH - groundY} fill="#1e293b" />
       <rect x={0} y={groundY} width={pxW} height={2} fill="#475569" />
-      {/* landing pad */}
       <rect x={padL} y={groundY - 6} width={padR - padL} height={6} fill="#fbbf24" />
       <line x1={padL} y1={groundY - 6} x2={padL} y2={groundY - 16} stroke="#fbbf24" strokeWidth="1.5" />
       <line x1={padR} y1={groundY - 6} x2={padR} y2={groundY - 16} stroke="#fbbf24" strokeWidth="1.5" />
-      {/* lander */}
       <g transform={`translate(${lx.toFixed(2)},${ly.toFixed(2)}) rotate(${thetaDeg})`}>
         {mainOn && (
           <polygon points="-4,10 4,10 0,22" fill="#f97316" opacity={0.85}>
@@ -241,19 +317,15 @@ function LanderView({ state, subtitle, badgeColor, bodyColor, epReward, lastEpRe
         )}
         {leftOn && <polygon points="6,-2 6,4 14,1" fill="#f97316" opacity={0.9} />}
         {rightOn && <polygon points="-6,-2 -6,4 -14,1" fill="#f97316" opacity={0.9} />}
-        {/* body */}
         <polygon points="-9,8 9,8 6,-9 -6,-9" fill={bodyColor} stroke="#0b1225" strokeWidth="1" />
         <circle cx={0} cy={-3} r={2.5} fill="#0ea5e9" opacity={0.85} />
-        {/* legs */}
         <line x1={-9} y1={8} x2={-13} y2={12} stroke="#94a3b8" strokeWidth="1.5" />
         <line x1={9} y1={8} x2={13} y2={12} stroke="#94a3b8" strokeWidth="1.5" />
       </g>
-      {/* status badge */}
       <rect x={8} y={8} width={150} height={20} fill="rgba(11, 18, 37, 0.8)" stroke={badgeColor} rx={3} />
       <text x={83} y={22} textAnchor="middle" fill={badgeColor} fontSize="10" fontFamily={font} fontWeight={600}>
         {subtitle}
       </text>
-      {/* live episode reward */}
       <rect x={pxW - 120} y={8} width={112} height={38} fill="rgba(11, 18, 37, 0.8)" stroke="#334155" rx={3} />
       <text x={pxW - 114} y={22} fill="#64748b" fontSize="9" fontFamily={font}>this ep</text>
       <text x={pxW - 14} y={22} textAnchor="end" fill={epReward >= 0 ? "#34d399" : "#f87171"} fontSize="11" fontFamily={font} fontWeight={600}>
@@ -263,7 +335,6 @@ function LanderView({ state, subtitle, badgeColor, bodyColor, epReward, lastEpRe
       <text x={pxW - 14} y={38} textAnchor="end" fill={lastEpReward == null ? "#64748b" : (lastEpReward >= 0 ? "#34d399" : "#f87171")} fontSize="11" fontFamily={font}>
         {lastEpReward == null ? "–" : lastEpReward.toFixed(1)}
       </text>
-      {/* outcome text */}
       {(state.landed || state.crashed) && (
         <g>
           <rect x={pxW / 2 - 60} y={pxH / 2 - 18} width={120} height={32} fill="rgba(11, 18, 37, 0.85)" stroke={state.landed ? "#34d399" : "#f87171"} rx={4} />
@@ -291,14 +362,9 @@ function btn(active, color) {
 }
 
 export default function App() {
-  // Policies
-  const initW = useRef(makeInitPolicy()).current;
-  const trainedRef = useRef(cloneW(initW));
-  const bestEverRef = useRef({ w: cloneW(initW), reward: -Infinity });
-  const meanRef = useRef(cloneW(initW));
-  const stdRef = useRef(makeUniform(1.4));
+  const WpRef = useRef(mkWp(0.15));
+  const WvRef = useRef(mkWv());
 
-  // Env states (refs so we can animate without re-init each frame)
   const untrainedState = useRef(envReset());
   const trainedState = useRef(envReset());
   const untrainedEpRewardRef = useRef(0);
@@ -307,33 +373,35 @@ export default function App() {
   const trainedLastRewardRef = useRef(null);
   const untrainedHoldUntilRef = useRef(0);
   const trainedHoldUntilRef = useRef(0);
-  // rolling action-usage counters for the trained agent (last ~200 steps)
   const trainedActionBufRef = useRef([]);
 
-  // UI state (only updated at frame tick)
   const [, forceRender] = useState(0);
   const [training, setTraining] = useState(false);
-  const [generation, setGeneration] = useState(0);
-  const [bestReward, setBestReward] = useState(null);
-  const [avgReward, setAvgReward] = useState(null);
-  const [bestEverReward, setBestEverReward] = useState(null);
+  const [iteration, setIteration] = useState(0);
+  const [avgReturn, setAvgReturn] = useState(null);
+  const [bestReturn, setBestReturn] = useState(null);
+  const [bestEverReturn, setBestEverReturn] = useState(null);
+  const bestEverRef = useRef(-Infinity);
+  const [polLoss, setPolLoss] = useState(null);
+  const [valLoss, setValLoss] = useState(null);
+  const [kl, setKl] = useState(null);
+  const [clipFrac, setClipFrac] = useState(null);
   const [history, setHistory] = useState([]);
-  const [popSize, setPopSize] = useState(50);
-  const [eliteFrac, setEliteFrac] = useState(0.3);
-  const [evalEps, setEvalEps] = useState(5);
+  const [lr, setLr] = useState(0.025);
+  const [ppoEpochs, setPpoEpochs] = useState(6);
+  const [rolloutSteps, setRolloutSteps] = useState(1024);
 
   const trainingRef = useRef(false);
   const stopFlag = useRef(false);
 
-  // Animation loop
   useEffect(() => {
     let running = true;
     let lastTick = 0;
     const tick = (ts) => {
       if (!running) return;
-      if (ts - lastTick >= 33) { // ~30 fps
+      if (ts - lastTick >= 33) {
         lastTick = ts;
-        // Untrained: random action (pure baseline)
+        // Untrained: uniform random action
         if (untrainedHoldUntilRef.current > 0) {
           untrainedHoldUntilRef.current -= 1;
           if (untrainedHoldUntilRef.current === 0) {
@@ -350,7 +418,7 @@ export default function App() {
             untrainedHoldUntilRef.current = 24;
           }
         }
-        // Trained: policy-based action
+        // Trained: sample from softmax policy
         if (trainedHoldUntilRef.current > 0) {
           trainedHoldUntilRef.current -= 1;
           if (trainedHoldUntilRef.current === 0) {
@@ -358,7 +426,8 @@ export default function App() {
             trainedEpRewardRef.current = 0;
           }
         } else {
-          const a = policyAction(trainedRef.current, trainedState.current);
+          const probs = policyForward(WpRef.current, obsVec(trainedState.current));
+          const a = sampleFromProbs(probs);
           const { state, reward, done } = envStep(trainedState.current, a);
           trainedState.current = state;
           trainedEpRewardRef.current += reward;
@@ -382,21 +451,25 @@ export default function App() {
     stopFlag.current = true;
     trainingRef.current = false;
     setTraining(false);
-    const init = makeInitPolicy();
-    meanRef.current = init;
-    stdRef.current = makeUniform(1.4);
-    trainedRef.current = cloneW(init);
-    bestEverRef.current = { w: cloneW(init), reward: -Infinity };
-    setGeneration(0); setBestReward(null); setAvgReward(null); setBestEverReward(null); setHistory([]);
+    WpRef.current = mkWp(0.15);
+    WvRef.current = mkWv();
+    bestEverRef.current = -Infinity;
+    setIteration(0);
+    setAvgReturn(null); setBestReturn(null); setBestEverReturn(null);
+    setPolLoss(null); setValLoss(null); setKl(null); setClipFrac(null);
+    setHistory([]);
+    trainedActionBufRef.current = [];
   };
 
   const resetTrainedEp = () => {
     trainedState.current = envReset();
     trainedHoldUntilRef.current = 0;
+    trainedEpRewardRef.current = 0;
   };
   const resetUntrainedEp = () => {
     untrainedState.current = envReset();
     untrainedHoldUntilRef.current = 0;
+    untrainedEpRewardRef.current = 0;
   };
 
   const startTrain = useCallback(async () => {
@@ -404,34 +477,54 @@ export default function App() {
     trainingRef.current = true;
     stopFlag.current = false;
     setTraining(true);
-    const elite = Math.max(2, Math.floor(popSize * eliteFrac));
+    const GAMMA = 0.99;
+    const LAMBDA = 0.95;
+    const CLIP_EPS = 0.2;
+    const VALUE_COEF = 0.5;
+    const ENTROPY_COEF = 0.01;
     while (trainingRef.current && !stopFlag.current) {
-      // run one CEM generation (synchronous), yield between
-      const { mean: nm, std: ns, best, avg } = cemGeneration(meanRef.current, stdRef.current, popSize, elite, evalEps);
-      meanRef.current = nm;
-      stdRef.current = ns;
-      // Right panel shows the current MEAN policy — it evolves smoothly as
-      // CEM concentrates mass on good regions of weight space, giving
-      // students a clean monotonic picture of learning (not a noisy
-      // per-gen best that can be a lucky fluke).
-      trainedRef.current = cloneW(nm);
-      if (best.reward > bestEverRef.current.reward) {
-        bestEverRef.current = { w: cloneW(best.w), reward: best.reward };
-        setBestEverReward(best.reward);
+      // Collect rollout
+      const { transitions, epReturns, lastV } = collectRollout(WpRef.current, WvRef.current, rolloutSteps);
+      // Compute GAE
+      const { advantages, returns } = computeAdvantages(transitions, lastV, GAMMA, LAMBDA);
+      // Multiple PPO epochs over the same rollout
+      let lastStats = null;
+      for (let ep = 0; ep < ppoEpochs; ep++) {
+        const upd = ppoUpdate(WpRef.current, WvRef.current, transitions, advantages, returns, {
+          clipEps: CLIP_EPS, lr, valueCoef: VALUE_COEF, entropyCoef: ENTROPY_COEF,
+        });
+        WpRef.current = upd.Wp;
+        WvRef.current = upd.Wv;
+        lastStats = upd;
+        // Early-stop if KL gets too big
+        if (Math.abs(upd.approxKL) > 0.03) break;
       }
-      setGeneration((g) => g + 1);
-      setBestReward(best.reward);
-      setAvgReward(avg);
-      setHistory((h) => {
-        const next = [...h, { best: best.reward, avg, bestEver: bestEverRef.current.reward }];
-        return next.length > 160 ? next.slice(-160) : next;
-      });
-      // yield to browser
-      await new Promise((r) => setTimeout(r, 6));
+      setIteration((i) => i + 1);
+      if (epReturns.length > 0) {
+        const avg = epReturns.reduce((a, b) => a + b, 0) / epReturns.length;
+        const best = Math.max(...epReturns);
+        setAvgReturn(avg);
+        setBestReturn(best);
+        if (best > bestEverRef.current) {
+          bestEverRef.current = best;
+          setBestEverReturn(best);
+        }
+        setHistory((h) => {
+          const next = [...h, { avg, best, bestEver: bestEverRef.current }];
+          return next.length > 160 ? next.slice(-160) : next;
+        });
+      }
+      if (lastStats) {
+        setPolLoss(lastStats.policyLoss);
+        setValLoss(lastStats.valueLoss);
+        setKl(lastStats.approxKL);
+        setClipFrac(lastStats.clipFrac);
+      }
+      await new Promise((r) => setTimeout(r, 8));
     }
     trainingRef.current = false;
     setTraining(false);
-  }, [popSize, eliteFrac, evalEps]);
+  }, [lr, ppoEpochs, rolloutSteps]);
 
   const stopTrain = () => {
     stopFlag.current = true;
@@ -468,41 +561,26 @@ export default function App() {
     <div style={{ minHeight: "100vh", background: "#0c0f1a", color: "#e2e8f0", fontFamily: font, padding: 18 }}>
       <div style={{ maxWidth: 1240, margin: "0 auto" }}>
         <header style={{ marginBottom: 16 }}>
-          <h1 style={{ fontSize: 22, fontWeight: 500, letterSpacing: "0.5px" }}>Reinforcement Learning · LunarLander (CEM)</h1>
+          <h1 style={{ fontSize: 22, fontWeight: 500, letterSpacing: "0.5px" }}>Reinforcement Learning · LunarLander (PPO)</h1>
           <p style={{ color: "#94a3b8", fontSize: 12, marginTop: 4, lineHeight: 1.55 }}>
-            A simplified LunarLander environment (gravity, main + side thrusters, rotation, yellow landing pad).
-            Left panel = untrained agent (random actions). Right panel = agent controlled by the current best policy from training.
-            Algorithm: <span style={{ color: "#34d399" }}>Cross-Entropy Method</span> over a linear policy (state → 4 discrete actions).
+            Simplified LunarLander. Left panel: agent that acts uniformly at random. Right panel: stochastic softmax policy, sampled live from the policy being trained.
+            Algorithm: <span style={{ color: "#34d399" }}>Proximal Policy Optimization (PPO)</span> with GAE advantages, a linear policy head and a linear value head.
           </p>
         </header>
 
         <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 18 }}>
           <div style={panel}>
-            <LanderView
-              state={untrainedState.current}
-              subtitle="UNTRAINED"
-              badgeColor="#f87171"
-              bodyColor="#94a3b8"
-              epReward={untrainedEpRewardRef.current}
-              lastEpReward={untrainedLastRewardRef.current}
-            />
+            <LanderView state={untrainedState.current} subtitle="UNTRAINED" badgeColor="#f87171" bodyColor="#94a3b8" epReward={untrainedEpRewardRef.current} lastEpReward={untrainedLastRewardRef.current} />
             <div style={{ display: "flex", gap: 8, marginTop: 10, alignItems: "center" }}>
               <button onClick={resetUntrainedEp} style={btn(false, "#64748b")}>New episode</button>
-              <span style={{ color: "#64748b", fontSize: 10, marginLeft: "auto" }}>random actions</span>
+              <span style={{ color: "#64748b", fontSize: 10, marginLeft: "auto" }}>uniform random actions</span>
             </div>
           </div>
           <div style={panel}>
-            <LanderView
-              state={trainedState.current}
-              subtitle={generation > 0 ? `TRAINED (gen ${generation})` : "TRAINED"}
-              badgeColor="#34d399"
-              bodyColor="#38bdf8"
-              epReward={trainedEpRewardRef.current}
-              lastEpReward={trainedLastRewardRef.current}
-            />
+            <LanderView state={trainedState.current} subtitle={iteration > 0 ? `TRAINED (iter ${iteration})` : "TRAINED"} badgeColor="#34d399" bodyColor="#38bdf8" epReward={trainedEpRewardRef.current} lastEpReward={trainedLastRewardRef.current} />
             <div style={{ display: "flex", gap: 8, marginTop: 10, alignItems: "center" }}>
               <button onClick={resetTrainedEp} style={btn(false, "#64748b")}>New episode</button>
-              <span style={{ color: "#64748b", fontSize: 10, marginLeft: "auto" }}>current mean policy</span>
+              <span style={{ color: "#64748b", fontSize: 10, marginLeft: "auto" }}>sampled from softmax policy</span>
             </div>
           </div>
         </div>
@@ -518,39 +596,36 @@ export default function App() {
             </div>
             <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 12, marginTop: 14 }}>
               <div>
-                <div style={{ fontSize: 10, color: "#64748b", marginBottom: 4 }}>population size</div>
+                <div style={{ fontSize: 10, color: "#64748b", marginBottom: 4 }}>learning rate</div>
                 <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                  <input type="range" min={10} max={80} step={2} value={popSize}
-                    onChange={(e) => setPopSize(parseInt(e.target.value, 10))}
-                    disabled={training}
-                    style={{ flex: 1 }} />
-                  <span style={{ color: "#67e8f9", fontSize: 11, width: 26, textAlign: "right" }}>{popSize}</span>
+                  <input type="range" min={0.005} max={0.05} step={0.005} value={lr}
+                    onChange={(e) => setLr(parseFloat(e.target.value))}
+                    disabled={training} style={{ flex: 1 }} />
+                  <span style={{ color: "#67e8f9", fontSize: 11, width: 42, textAlign: "right" }}>{lr.toFixed(3)}</span>
                 </div>
               </div>
               <div>
-                <div style={{ fontSize: 10, color: "#64748b", marginBottom: 4 }}>elite fraction</div>
+                <div style={{ fontSize: 10, color: "#64748b", marginBottom: 4 }}>rollout steps</div>
                 <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                  <input type="range" min={0.1} max={0.5} step={0.05} value={eliteFrac}
-                    onChange={(e) => setEliteFrac(parseFloat(e.target.value))}
-                    disabled={training}
-                    style={{ flex: 1 }} />
-                  <span style={{ color: "#67e8f9", fontSize: 11, width: 34, textAlign: "right" }}>{eliteFrac.toFixed(2)}</span>
+                  <input type="range" min={256} max={2048} step={128} value={rolloutSteps}
+                    onChange={(e) => setRolloutSteps(parseInt(e.target.value, 10))}
+                    disabled={training} style={{ flex: 1 }} />
+                  <span style={{ color: "#67e8f9", fontSize: 11, width: 38, textAlign: "right" }}>{rolloutSteps}</span>
                 </div>
               </div>
               <div>
-                <div style={{ fontSize: 10, color: "#64748b", marginBottom: 4 }}>eval episodes</div>
+                <div style={{ fontSize: 10, color: "#64748b", marginBottom: 4 }}>PPO epochs</div>
                 <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                  <input type="range" min={1} max={5} step={1} value={evalEps}
-                    onChange={(e) => setEvalEps(parseInt(e.target.value, 10))}
-                    disabled={training}
-                    style={{ flex: 1 }} />
-                  <span style={{ color: "#67e8f9", fontSize: 11, width: 20, textAlign: "right" }}>{evalEps}</span>
+                  <input type="range" min={1} max={10} step={1} value={ppoEpochs}
+                    onChange={(e) => setPpoEpochs(parseInt(e.target.value, 10))}
+                    disabled={training} style={{ flex: 1 }} />
+                  <span style={{ color: "#67e8f9", fontSize: 11, width: 20, textAlign: "right" }}>{ppoEpochs}</span>
                 </div>
               </div>
             </div>
             <div style={{ marginTop: 14 }}>
               <div style={{ fontSize: 10, color: "#64748b", marginBottom: 4 }}>
-                reward · <span style={{ color: "#34d399" }}>best-ever</span> / <span style={{ color: "#38bdf8" }}>gen best</span> / <span style={{ color: "#94a3b8" }}>gen avg</span>
+                rollout return · <span style={{ color: "#34d399" }}>best-ever</span> / <span style={{ color: "#38bdf8" }}>iter best</span> / <span style={{ color: "#94a3b8" }}>iter mean</span>
               </div>
               {lossChart || <div style={{ height: 68, border: "1px dashed #1e293b", borderRadius: 4, display: "flex", alignItems: "center", justifyContent: "center", color: "#475569", fontSize: 11 }}>no data yet</div>}
             </div>
@@ -558,17 +633,15 @@ export default function App() {
 
           <div style={panel}>
             <div style={{ fontSize: 11, color: "#94a3b8", marginBottom: 8 }}>metrics</div>
-            <div style={{ fontSize: 12, lineHeight: 1.8 }}>
-              <div>generation: <span style={{ color: "#e2e8f0" }}>{generation}</span></div>
-              <div>best-ever: <span style={{ color: "#34d399" }}>{bestEverReward == null ? "–" : bestEverReward.toFixed(2)}</span></div>
-              <div>gen best: <span style={{ color: "#38bdf8" }}>{bestReward == null ? "–" : bestReward.toFixed(2)}</span></div>
-              <div>gen avg:&nbsp; <span style={{ color: "#94a3b8" }}>{avgReward == null ? "–" : avgReward.toFixed(2)}</span></div>
-            </div>
-            <div style={{ marginTop: 10, paddingTop: 10, borderTop: "1px solid #1e293b", fontSize: 11, color: "#94a3b8", lineHeight: 1.6 }}>
-              <div style={{ color: "#67e8f9", fontSize: 10, marginBottom: 4 }}>reading the plot</div>
-              The green <strong style={{ color: "#34d399" }}>best</strong> curve climbs as CEM concentrates weight mass on strong policies.
-              The gray <strong style={{ color: "#94a3b8" }}>mean</strong> curve trails it since CEM still samples around the current mean.
-              Reward &gt; 80 usually means the agent is landing on the pad.
+            <div style={{ fontSize: 11, lineHeight: 1.75 }}>
+              <div>iteration: <span style={{ color: "#e2e8f0" }}>{iteration}</span></div>
+              <div>best-ever return: <span style={{ color: "#34d399" }}>{bestEverReturn == null ? "–" : bestEverReturn.toFixed(2)}</span></div>
+              <div>iter best: <span style={{ color: "#38bdf8" }}>{bestReturn == null ? "–" : bestReturn.toFixed(2)}</span></div>
+              <div>iter mean: <span style={{ color: "#94a3b8" }}>{avgReturn == null ? "–" : avgReturn.toFixed(2)}</span></div>
+              <div style={{ marginTop: 6, paddingTop: 6, borderTop: "1px solid #1e293b" }}>policy loss: <span style={{ color: "#f472b6" }}>{polLoss == null ? "–" : polLoss.toFixed(4)}</span></div>
+              <div>value loss:&nbsp; <span style={{ color: "#fbbf24" }}>{valLoss == null ? "–" : valLoss.toFixed(3)}</span></div>
+              <div>approx KL:&nbsp; <span style={{ color: "#a78bfa" }}>{kl == null ? "–" : kl.toFixed(4)}</span></div>
+              <div>clip frac:&nbsp; <span style={{ color: "#67e8f9" }}>{clipFrac == null ? "–" : (clipFrac * 100).toFixed(1) + "%"}</span></div>
             </div>
             <div style={{ marginTop: 10, paddingTop: 10, borderTop: "1px solid #1e293b", fontSize: 11, color: "#94a3b8", lineHeight: 1.6 }}>
               <div style={{ color: "#fbbf24", fontSize: 10, marginBottom: 6 }}>action usage (trained, last ~200 steps)</div>
@@ -590,12 +663,11 @@ export default function App() {
                   </div>
                 ));
               })()}
-              <div style={{ color: "#64748b", marginTop: 6, fontSize: 10 }}>no no-op — agent must act each step</div>
             </div>
           </div>
         </div>
         <footer style={{ marginTop: 18, color: "#475569", fontSize: 10, textAlign: "center" }}>
-          simplified LunarLander · linear policy (4×7 = 28 params) · Cross-Entropy Method
+          simplified LunarLander · linear softmax policy · linear value · GAE(γ=0.99, λ=0.95) · clip ε=0.2
         </footer>
       </div>
     </div>
