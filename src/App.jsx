@@ -21,12 +21,12 @@ function randn() {
 
 function envReset() {
   return {
-    x: WORLD_W / 2 + rand(-3.5, 3.5),
+    x: WORLD_W / 2 + rand(-2.5, 2.5),
     y: WORLD_H - 2,
-    vx: rand(-0.35, 0.35),     // horizontal drift — passive fall crashes off-pad
-    vy: rand(-0.3, -0.1),      // already descending — must use main engine
-    theta: rand(-0.2, 0.2),    // tilted — must stabilize
-    omega: rand(-0.012, 0.012),
+    vx: rand(-0.22, 0.22),     // horizontal drift — passive fall crashes off-pad
+    vy: rand(-0.25, -0.1),     // already descending — must use main engine
+    theta: rand(-0.15, 0.15),  // tilted — must stabilize
+    omega: rand(-0.01, 0.01),
     steps: 0,
     landed: false,
     crashed: false,
@@ -59,14 +59,13 @@ function envStep(s, action) {
   // reward shaping: stronger gradient toward pad, especially near ground
   const heightFactor = Math.max(0, 1 - Math.max(0, y) / WORLD_H);
   let reward = 0;
-  reward -= Math.abs(x - PAD_X) * (0.012 + 0.035 * heightFactor);
-  reward -= Math.abs(theta) * 0.1;
-  reward -= (Math.abs(vx) * 0.06 + Math.abs(vy) * 0.04);
+  reward -= Math.abs(x - PAD_X) * (0.02 + 0.06 * heightFactor);
+  reward -= Math.abs(theta) * 0.12;
+  reward -= (Math.abs(vx) * 0.08 + Math.abs(vy) * 0.04);
   reward -= 0.012;
-  if (action === 1) reward -= 0.012;
   // hovering-over-pad bonus: descending slowly above the pad is good
   if (Math.abs(x - PAD_X) < PAD_HALF && y > GROUND_Y + 0.5 && vy > -0.35 && vy < 0.1) {
-    reward += 0.06;
+    reward += 0.1;
   }
 
   const ns = { x, y, vx, vy, theta, omega, steps, landed: false, crashed: false, lastAction: action, done: false };
@@ -124,6 +123,12 @@ function makeZeros() {
 }
 function makeSmallRandom(scale = 0.2) {
   return [...Array(N_ACT)].map(() => [...Array(N_OBS)].map(() => randn() * scale));
+}
+function makeInitPolicy() {
+  // Anti-noop init: penalize action 0's bias so early populations must use thrusters.
+  const W = makeSmallRandom(0.25);
+  W[0][N_OBS - 1] -= 1.5;
+  return W;
 }
 function makeUniform(val) {
   return [...Array(N_ACT)].map(() => [...Array(N_OBS)].fill(val));
@@ -268,9 +273,10 @@ function btn(active, color) {
 
 export default function App() {
   // Policies
-  const trainedRef = useRef(makeSmallRandom(0.2));
-  const bestEverRef = useRef({ w: makeSmallRandom(0.2), reward: -Infinity });
-  const meanRef = useRef(makeSmallRandom(0.2));
+  const initW = useRef(makeInitPolicy()).current;
+  const trainedRef = useRef(cloneW(initW));
+  const bestEverRef = useRef({ w: cloneW(initW), reward: -Infinity });
+  const meanRef = useRef(cloneW(initW));
   const stdRef = useRef(makeUniform(1.4));
 
   // Env states (refs so we can animate without re-init each frame)
@@ -291,9 +297,9 @@ export default function App() {
   const [avgReward, setAvgReward] = useState(null);
   const [bestEverReward, setBestEverReward] = useState(null);
   const [history, setHistory] = useState([]);
-  const [popSize, setPopSize] = useState(40);
-  const [eliteFrac, setEliteFrac] = useState(0.25);
-  const [evalEps, setEvalEps] = useState(3);
+  const [popSize, setPopSize] = useState(50);
+  const [eliteFrac, setEliteFrac] = useState(0.3);
+  const [evalEps, setEvalEps] = useState(5);
 
   const trainingRef = useRef(false);
   const stopFlag = useRef(false);
@@ -352,11 +358,11 @@ export default function App() {
     stopFlag.current = true;
     trainingRef.current = false;
     setTraining(false);
-    const initW = makeSmallRandom(0.2);
-    meanRef.current = initW;
+    const init = makeInitPolicy();
+    meanRef.current = init;
     stdRef.current = makeUniform(1.4);
-    trainedRef.current = cloneW(initW);
-    bestEverRef.current = { w: cloneW(initW), reward: -Infinity };
+    trainedRef.current = cloneW(init);
+    bestEverRef.current = { w: cloneW(init), reward: -Infinity };
     setGeneration(0); setBestReward(null); setAvgReward(null); setBestEverReward(null); setHistory([]);
   };
 
@@ -380,10 +386,13 @@ export default function App() {
       const { mean: nm, std: ns, best, avg } = cemGeneration(meanRef.current, stdRef.current, popSize, elite, evalEps);
       meanRef.current = nm;
       stdRef.current = ns;
-      // Keep best-ever policy on the right panel so it improves monotonically.
+      // Right panel shows the current MEAN policy — it evolves smoothly as
+      // CEM concentrates mass on good regions of weight space, giving
+      // students a clean monotonic picture of learning (not a noisy
+      // per-gen best that can be a lucky fluke).
+      trainedRef.current = cloneW(nm);
       if (best.reward > bestEverRef.current.reward) {
         bestEverRef.current = { w: cloneW(best.w), reward: best.reward };
-        trainedRef.current = cloneW(best.w);
         setBestEverReward(best.reward);
       }
       setGeneration((g) => g + 1);
@@ -469,7 +478,7 @@ export default function App() {
             />
             <div style={{ display: "flex", gap: 8, marginTop: 10, alignItems: "center" }}>
               <button onClick={resetTrainedEp} style={btn(false, "#64748b")}>New episode</button>
-              <span style={{ color: "#64748b", fontSize: 10, marginLeft: "auto" }}>best-ever policy</span>
+              <span style={{ color: "#64748b", fontSize: 10, marginLeft: "auto" }}>current mean policy</span>
             </div>
           </div>
         </div>
