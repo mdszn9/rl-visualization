@@ -155,15 +155,15 @@ function LanderScene({ episode, frameIdx, title, badgeColor, bodyColor }) {
   );
 }
 
-function useEpisodePlayer(episodes, fps = 30, holdFrames = 25) {
+function useEpisodePlayer(episodes, { fps = 30, holdFrames = 25, enabled = true } = {}) {
   const [epIdx, setEpIdx] = useState(0);
   const [frameIdx, setFrameIdx] = useState(0);
   const holdRef = useRef(0);
-  const runningRef = useRef(true);
 
   useEffect(() => {
+    if (!enabled) return;
     const id = setInterval(() => {
-      if (!runningRef.current || !episodes || episodes.length === 0) return;
+      if (!episodes || episodes.length === 0) return;
       setFrameIdx((f) => {
         const ep = episodes[epIdx];
         if (!ep) return 0;
@@ -178,7 +178,7 @@ function useEpisodePlayer(episodes, fps = 30, holdFrames = 25) {
       });
     }, 1000 / fps);
     return () => clearInterval(id);
-  }, [epIdx, episodes, fps, holdFrames]);
+  }, [epIdx, episodes, fps, holdFrames, enabled]);
 
   const reset = () => {
     holdRef.current = 0;
@@ -189,8 +189,13 @@ function useEpisodePlayer(episodes, fps = 30, holdFrames = 25) {
     setFrameIdx(0);
     setEpIdx((i) => (i + 1) % (episodes?.length || 1));
   };
+  const restartFromEp1 = () => {
+    holdRef.current = 0;
+    setEpIdx(0);
+    setFrameIdx(0);
+  };
 
-  return { epIdx, frameIdx, reset, nextEpisode };
+  return { epIdx, frameIdx, reset, nextEpisode, restartFromEp1 };
 }
 
 export default function App() {
@@ -212,8 +217,14 @@ export default function App() {
   const trained = data?.trained ?? [];
   const untrained = data?.untrained ?? [];
 
-  const trainedPlayer = useEpisodePlayer(trained);
+  const trainedPlayer = useEpisodePlayer(trained, { enabled: showTrained });
   const untrainedPlayer = useEpisodePlayer(untrained);
+
+  const loadPPO = () => {
+    trainedPlayer.restartFromEp1();
+    setShowTrained(true);
+  };
+  const hidePPO = () => setShowTrained(false);
 
   const trainedEp = trained[trainedPlayer.epIdx];
   const untrainedEp = untrained[untrainedPlayer.epIdx];
@@ -268,7 +279,7 @@ export default function App() {
                     Restart
                   </button>
                   {!showTrained && (
-                    <button onClick={() => setShowTrained(true)} style={btn(true, "#34d399")}>
+                    <button onClick={loadPPO} style={btn(true, "#34d399")}>
                       Load PPO agent →
                     </button>
                   )}
@@ -294,7 +305,7 @@ export default function App() {
                     <button onClick={trainedPlayer.reset} style={btn(false, "#64748b")}>
                       Restart
                     </button>
-                    <button onClick={() => setShowTrained(false)} style={btn(false, "#64748b")}>
+                    <button onClick={hidePPO} style={btn(false, "#64748b")}>
                       Hide
                     </button>
                     <span style={{ color: "#64748b", fontSize: 10, marginLeft: "auto" }}>
