@@ -11,7 +11,12 @@ const PAD_X = 10, PAD_HALF = 1.9;
 const GROUND_Y = 0.55;
 const MAX_STEPS = 400;
 
-const N_OBS = 7, N_ACT = 4;
+// Action space: 0 = main thrust, 1 = rotate CCW, 2 = rotate CW.
+// No-op is intentionally excluded: with a linear policy, CEM falls into the
+// trivial "always do nothing" attractor that lands sometimes by lucky starts
+// but never learns active control. Removing no-op forces the agent to learn
+// to balance thrusters.
+const N_OBS = 7, N_ACT = 3;
 
 function rand(a, b) { return Math.random() * (b - a) + a; }
 function randn() {
@@ -39,12 +44,12 @@ function envStep(s, action) {
   if (s.done) return { state: s, reward: 0, done: true };
   let { x, y, vx, vy, theta, omega, steps } = s;
   let tX = 0, tY = 0, torque = 0;
-  if (action === 1) {
+  if (action === 0) {
     tX = Math.sin(theta) * MAIN_THRUST;
     tY = Math.cos(theta) * MAIN_THRUST;
-  } else if (action === 2) {
+  } else if (action === 1) {
     torque = -SIDE_TORQUE;
-  } else if (action === 3) {
+  } else if (action === 2) {
     torque = SIDE_TORQUE;
   }
   vy += tY - GRAVITY;
@@ -65,7 +70,7 @@ function envStep(s, action) {
   reward -= 0.012;
   // hovering-over-pad bonus: descending slowly above the pad is good
   if (Math.abs(x - PAD_X) < PAD_HALF && y > GROUND_Y + 0.5 && vy > -0.35 && vy < 0.1) {
-    reward += 0.1;
+    reward += 0.18;
   }
 
   const ns = { x, y, vx, vy, theta, omega, steps, landed: false, crashed: false, lastAction: action, done: false };
@@ -125,10 +130,7 @@ function makeSmallRandom(scale = 0.2) {
   return [...Array(N_ACT)].map(() => [...Array(N_OBS)].map(() => randn() * scale));
 }
 function makeInitPolicy() {
-  // Anti-noop init: penalize action 0's bias so early populations must use thrusters.
-  const W = makeSmallRandom(0.25);
-  W[0][N_OBS - 1] -= 1.5;
-  return W;
+  return makeSmallRandom(0.3);
 }
 function makeUniform(val) {
   return [...Array(N_ACT)].map(() => [...Array(N_OBS)].fill(val));
@@ -193,9 +195,9 @@ function LanderView({ state, subtitle, badgeColor, bodyColor, epReward, lastEpRe
   const groundY = padY;
 
   const thetaDeg = (state.theta * 180 / Math.PI).toFixed(1);
-  const mainOn = state.lastAction === 1 && !state.crashed && !state.landed;
-  const leftOn = state.lastAction === 2 && !state.crashed && !state.landed;
-  const rightOn = state.lastAction === 3 && !state.crashed && !state.landed;
+  const mainOn = state.lastAction === 0 && !state.crashed && !state.landed;
+  const leftOn = state.lastAction === 1 && !state.crashed && !state.landed;
+  const rightOn = state.lastAction === 2 && !state.crashed && !state.landed;
 
   return (
     <svg viewBox={`0 0 ${pxW} ${pxH}`} style={{ width: "100%", display: "block", background: "#070914", borderRadius: 8 }}>
@@ -547,11 +549,11 @@ export default function App() {
               Reward &gt; 80 usually means the agent is landing on the pad.
             </div>
             <div style={{ marginTop: 10, paddingTop: 10, borderTop: "1px solid #1e293b", fontSize: 11, color: "#94a3b8", lineHeight: 1.6 }}>
-              <div style={{ color: "#fbbf24", fontSize: 10, marginBottom: 4 }}>actions</div>
-              <div>0: do nothing</div>
-              <div>1: fire main engine</div>
-              <div>2: fire right-side thruster (rotate left)</div>
-              <div>3: fire left-side thruster (rotate right)</div>
+              <div style={{ color: "#fbbf24", fontSize: 10, marginBottom: 4 }}>actions (3)</div>
+              <div>0: fire main engine</div>
+              <div>1: rotate CCW (lean left)</div>
+              <div>2: rotate CW (lean right)</div>
+              <div style={{ color: "#64748b", marginTop: 4, fontSize: 10 }}>no no-op — agent must act each step</div>
             </div>
           </div>
         </div>
