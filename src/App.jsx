@@ -4,8 +4,8 @@ import { useState, useRef, useEffect, useCallback } from "react";
 const WORLD_W = 20;
 const WORLD_H = 15;
 const GRAVITY = 0.006;
-const MAIN_THRUST = 0.014;
-const SIDE_TORQUE = 0.0014;
+const MAIN_THRUST = 0.016;
+const SIDE_TORQUE = 0.0016;
 const OMEGA_DAMP = 0.985;
 const PAD_X = 10, PAD_HALF = 1.9;
 const GROUND_Y = 0.55;
@@ -23,10 +23,10 @@ function envReset() {
   return {
     x: WORLD_W / 2 + rand(-3.5, 3.5),
     y: WORLD_H - 2,
-    vx: rand(-0.08, 0.08),
-    vy: 0,
-    theta: rand(-0.08, 0.08),
-    omega: 0,
+    vx: rand(-0.35, 0.35),     // horizontal drift — passive fall crashes off-pad
+    vy: rand(-0.3, -0.1),      // already descending — must use main engine
+    theta: rand(-0.2, 0.2),    // tilted — must stabilize
+    omega: rand(-0.012, 0.012),
     steps: 0,
     landed: false,
     crashed: false,
@@ -59,11 +59,15 @@ function envStep(s, action) {
   // reward shaping: stronger gradient toward pad, especially near ground
   const heightFactor = Math.max(0, 1 - Math.max(0, y) / WORLD_H);
   let reward = 0;
-  reward -= Math.abs(x - PAD_X) * (0.01 + 0.03 * heightFactor);
-  reward -= Math.abs(theta) * 0.08;
-  reward -= (Math.abs(vx) * 0.05 + Math.abs(vy) * 0.03);
+  reward -= Math.abs(x - PAD_X) * (0.012 + 0.035 * heightFactor);
+  reward -= Math.abs(theta) * 0.1;
+  reward -= (Math.abs(vx) * 0.06 + Math.abs(vy) * 0.04);
   reward -= 0.012;
-  if (action === 1) reward -= 0.015;
+  if (action === 1) reward -= 0.012;
+  // hovering-over-pad bonus: descending slowly above the pad is good
+  if (Math.abs(x - PAD_X) < PAD_HALF && y > GROUND_Y + 0.5 && vy > -0.35 && vy < 0.1) {
+    reward += 0.06;
+  }
 
   const ns = { x, y, vx, vy, theta, omega, steps, landed: false, crashed: false, lastAction: action, done: false };
 
@@ -152,9 +156,9 @@ function cemGeneration(mean, std, popSize, elite, evalEpisodes) {
   const newMean = mean.map((row, a) => row.map((_, i) =>
     top.reduce((s, p) => s + p.w[a][i], 0) / top.length
   ));
-  // std floor (0.1) keeps exploration alive; multiply by 0.97 to gently anneal
-  const STD_FLOOR = 0.1;
-  const ANNEAL = 0.97;
+  // std floor (0.15) keeps exploration alive longer to escape "do nothing" local optimum
+  const STD_FLOOR = 0.15;
+  const ANNEAL = 0.98;
   const newStd = mean.map((row, a) => row.map((_, i) => {
     const m = newMean[a][i];
     const v = top.reduce((s, p) => s + (p.w[a][i] - m) ** 2, 0) / top.length;
@@ -264,10 +268,10 @@ function btn(active, color) {
 
 export default function App() {
   // Policies
-  const trainedRef = useRef(makeSmallRandom(0.15));
-  const bestEverRef = useRef({ w: makeSmallRandom(0.15), reward: -Infinity });
-  const meanRef = useRef(makeSmallRandom(0.15));
-  const stdRef = useRef(makeUniform(1.2));
+  const trainedRef = useRef(makeSmallRandom(0.2));
+  const bestEverRef = useRef({ w: makeSmallRandom(0.2), reward: -Infinity });
+  const meanRef = useRef(makeSmallRandom(0.2));
+  const stdRef = useRef(makeUniform(1.4));
 
   // Env states (refs so we can animate without re-init each frame)
   const untrainedState = useRef(envReset());
@@ -348,9 +352,9 @@ export default function App() {
     stopFlag.current = true;
     trainingRef.current = false;
     setTraining(false);
-    const initW = makeSmallRandom(0.15);
+    const initW = makeSmallRandom(0.2);
     meanRef.current = initW;
-    stdRef.current = makeUniform(1.2);
+    stdRef.current = makeUniform(1.4);
     trainedRef.current = cloneW(initW);
     bestEverRef.current = { w: cloneW(initW), reward: -Infinity };
     setGeneration(0); setBestReward(null); setAvgReward(null); setBestEverReward(null); setHistory([]);
